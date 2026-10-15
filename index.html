@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- SSO tokens ride in the URL; never leak them via Referer. -->
+    <meta name="referrer" content="no-referrer">
+    <title>SSO Relay</title>
+    <style>
+    :root { --bg: #f6f7f9; --fg: #1d2330; --muted: #5b6475; --card: #fff; --line: #d9dde4; --accent: #2f6fde; --bad: #c2362b; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #14171c; --fg: #e6e9ef; --muted: #9aa3b2; --card: #1d2128; --line: #323844; --accent: #6b9cff; --bad: #ff7a6e; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; padding: 32px 16px; }
+    main { max-width: 640px; margin: 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 24px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 28px 0 4px; }
+    p, li { color: var(--muted); }
+    label { display: block; font-weight: 600; margin: 16px 0 6px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input, textarea { flex: 1 1 260px; min-width: 0; width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+    textarea { min-height: 96px; resize: vertical; font-family: ui-monospace, monospace; font-size: 13px; }
+    button { padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+    code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; word-break: break-all; }
+    .msg { margin-top: 10px; min-height: 1.5em; }
+    .bad { color: var(--bad); }
+  </style>
+  </head>
+  <body>
+    <main id="app" hidden>
+      <h1>SSO Relay</h1>
+      <p>Forwards SSO callbacks to a local or LAN instance of the app, keeping
+        the
+        route and every SSO parameter
+        (<code>#/login?SSORequestToken=…</code>).</p>
+
+      <label for="target">Target app root (saved in this browser)</label>
+      <div class="row">
+        <input id="target" type="url" placeholder="http://192.168.100.11:9292/"
+          autocomplete="off">
+        <button id="save" type="button">Save</button>
+      </div>
+      <div id="target-msg" class="msg"></div>
+
+      <h2>Replay a callback</h2>
+      <p>Paste the URL the IdP redirected to (e.g. the
+        <code>digitalinvestor-intg…/app/#/login?SSORequestToken=…</code> one).
+        Its host
+        and path are swapped for the target. Tokens are short-lived, so paste it
+        right away.</p>
+      <textarea id="pasted" spellcheck="false" autocomplete="off"
+        placeholder="https://…/app/#/login?SSORequestToken=…"></textarea>
+      <div class="row" style="margin-top:8px"><button id="replay"
+          type="button">Open on target</button></div>
+      <div id="replay-msg" class="msg"></div>
+
+      <h2>Direct callbacks</h2>
+      <p>To skip the paste step, register this page's URL as the partner's
+        return URL:
+        <code id="self"></code>. Callbacks are forwarded automatically, to
+        <code>RelayState</code>
+        if it's allowed, otherwise to the saved target.</p>
+      <p>Only localhost and private-network targets are accepted, unless the
+        host is
+        added to <code>EXTRA_ALLOWED_HOSTS</code> in this file.</p>
+    </main>
+
+    <script>
+(function () {
+  'use strict';
+
+  // Public hosts (exact hostname match) that may also receive tokens,
+  // e.g. 'my-staging.herokuapp.com'. Keep this short: anything listed
+  // here can be sent a live SSO token.
+  var EXTRA_ALLOWED_HOSTS = [];
+
+  var DEFAULT_TARGET = 'http://192.168.100.11:9292/';
+  var STORAGE_KEY = 'sso_relay_target';
+  // Any of these means "this is an IdP callback".
+  var SSO_PARAMS = ['SSORequestToken', 'gatekeeperKey', 'token'];
+
+  var selfUrl = location.origin + location.pathname;
+
+  // The app sends RelayState already percent-encoded, and the URI builder
+  // encodes it again, so decode until it stops changing.
+  function fullyDecode(value) {
+    for (var i = 0; i < 5; i++) {
+      var next;
+      try { next = decodeURIComponent(value); } catch (e) { return value; }
+      if (next === value) return value;
+      value = next;
+    }
+    return value;
+  }
+
+  function isPrivateHost(host) {
+    if (host === 'localhost' || /\.local$/.test(host)) return true;
+    var m = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+    if (!m) return false;
+    var a = +m[1], b = +m[2];
+    return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+  }
+
+  // Returns a URL object for an acceptable target, or null.
+  function parseTarget(raw) {
+    if (!raw) return null;
+    var url;
+    try { url = new URL(fullyDecode(String(raw).trim())); } catch (e) { return null; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (url.origin === location.origin) return null; // would loop
+    if (!isPrivateHost(url.hostname) && EXTRA_ALLOWED_HOSTS.indexOf(url.hostname) === -1) return null;
+    return url;
+  }
+
+  // The app uses hash routing, so SSO params usually sit in the fragment
+  // (#/login?SSORequestToken=…) rather than the real query string.
+  function callbackParams(url) {
+    var all = new URLSearchParams(url.search);
+    var q = url.hash.indexOf('?');
+    if (q !== -1) {
+      new URLSearchParams(url.hash.slice(q + 1)).forEach(function (v, k) { all.set(k, v); });
+    }
+    return all;
+  }
+
+  function isCallback(params) {
+    return SSO_PARAMS.some(function (p) { return params.has(p); });
+  }
+
+  // Target root + the callback's own query and route. A callback with no
+  // route lands on #/login, which is where the app handles SSO params.
+  function forwardUrl(target, callback) {
+    var hash = callback.hash || ('#/login' + callback.search);
+    var search = callback.hash ? callback.search : '';
+    return target.origin + target.pathname + search + hash;
+  }
+
+  function savedTarget() {
+    try { return localStorage.getItem(STORAGE_KEY); } catch (e) { return null; }
+  }
+
+  function saveTarget(url) {
+    try { localStorage.setItem(STORAGE_KEY, url.href); return true; } catch (e) { return false; }
+  }
+
+  function currentTarget() {
+    return parseTarget(savedTarget()) || parseTarget(DEFAULT_TARGET);
+  }
+
+  var here = new URL(location.href);
+  var hereParams = callbackParams(here);
+
+  if (isCallback(hereParams)) {
+    var target = parseTarget(hereParams.get('RelayState')) || currentTarget();
+    if (target) {
+      location.replace(forwardUrl(target, here));
+      return;
+    }
+  }
+  // Never keep a token in this page's history.
+  if (here.search || here.hash) history.replaceState(null, '', selfUrl);
+
+  // Setup UI
+  var input = document.getElementById('target');
+  var pasted = document.getElementById('pasted');
+
+  function say(id, text, bad) {
+    var el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'msg' + (bad ? ' bad' : '');
+  }
+
+  function trySave(raw) {
+    var url = parseTarget(raw);
+    if (!url) {
+      say('target-msg', 'Not accepted. Use an http(s) URL on localhost or a private-network address.', true);
+      return;
+    }
+    if (!saveTarget(url)) {
+      say('target-msg', 'This browser blocked storage (private mode?). Using the default target.', true);
+      return;
+    }
+    input.value = url.href;
+    say('target-msg', 'Saved. Callbacks will be forwarded to ' + url.href);
+  }
+
+  function replay() {
+    var target = parseTarget(input.value) || currentTarget();
+    var callback;
+    try { callback = new URL(pasted.value.trim()); } catch (e) {
+      say('replay-msg', 'That isn\'t a full URL.', true);
+      return;
+    }
+    if (!isCallback(callbackParams(callback))) {
+      say('replay-msg', 'No SSORequestToken or gatekeeperKey found in that URL.', true);
+      return;
+    }
+    pasted.value = '';
+    location.assign(forwardUrl(target, callback));
+  }
+
+  document.getElementById('self').textContent = selfUrl;
+  input.value = (currentTarget() || {}).href || '';
+
+  if (here.searchParams.has('target')) trySave(here.searchParams.get('target'));
+  else if (!savedTarget()) say('target-msg', 'Using the default target. Save to change it.');
+
+  document.getElementById('save').addEventListener('click', function () { trySave(input.value); });
+  input.addEventListener('keydown', function (e) { if (e.key === 'Enter') trySave(input.value); });
+  document.getElementById('replay').addEventListener('click', replay);
+  pasted.addEventListener('paste', function () { setTimeout(replay, 0); });
+
+  document.getElementById('app').hidden = false;
+})();
+</script>
+  </body>
+</html>
